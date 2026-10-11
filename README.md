@@ -1,3 +1,5 @@
+![NFSC_RestoreHeatConditions](thumbnail.png)
+
 # NFSC_RestoreHeatConditions
 
 A mod for `Carbon` that restores the `unused heat level radio calls` for heat 6, 7, 8, 9 and 10.
