@@ -1,4 +1,4 @@
-![NFSC_RestoreHeatConditions](thumbnail.png)
+![NFSC_RestoreHeatConditions](Thumbnail.png)
 
 # NFSC_RestoreHeatConditions
 
