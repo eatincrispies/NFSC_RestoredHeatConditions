@@ -8,8 +8,6 @@
 #include <cstring>
 #include "SoundAI.hpp"
 
-static constexpr const char* kVersion = "V1.0.0";
-
 static constexpr uintptr_t kAddrSyncPlayers = 0x00793840u;
 static constexpr uintptr_t kAddrHeatCutoffs = 0x009ECCB4u;
 static constexpr uintptr_t kAddrPrevHeat    = 0x00A71BA8u;
@@ -31,24 +29,10 @@ static_assert(sizeof(SoundAI::HeatCutoffs) == 8, "SoundAI::heat_cutoffs entries 
 static_assert(offsetof(SoundAI, mPlayerHeat) == 0x100, "SoundAI::mPlayerHeat");
 
 #ifdef _DEBUG
+static constexpr const char* kVersion = "V1.0.0";
 static FILE* gLogFile = nullptr;
 
-static void OpenLog(void* module) {
-    char path[MAX_PATH] = "";
-    DWORD len = GetModuleFileNameA(static_cast<HMODULE>(module), path, MAX_PATH);
-    char* dot = (len > 0 && len < MAX_PATH) ? std::strrchr(path, '.') : nullptr;
-    if (!dot || dot < std::strrchr(path, '\\')) return;
-    if (static_cast<size_t>(dot - path) + sizeof(".log") > sizeof(path)) return;
-    std::strcpy(dot, ".log");
-    gLogFile = std::fopen(path, "w");
-}
-
-static void CloseLog() {
-    if (gLogFile) std::fclose(gLogFile);
-    gLogFile = nullptr;
-}
-
-static void WriteLog(const char* fmt, ...) {
+static void DebugLog(const char* fmt, ...) {
     if (!gLogFile) return;
     char line[256] = "";
     va_list args;
@@ -60,12 +44,9 @@ static void WriteLog(const char* fmt, ...) {
     std::fflush(gLogFile);
 }
 
-#define LOG(...) WriteLog(__VA_ARGS__)
+#define LOG(...) DebugLog(__VA_ARGS__)
 #else
-static void OpenLog(void*) {}
-static void CloseLog() {}
-static void WriteLog(const char*, ...);
-#define LOG(...) ((void)sizeof((WriteLog(__VA_ARGS__), 0)))
+#define LOG(...) ((void)0)
 #endif
 
 struct SavedDword {
@@ -167,8 +148,19 @@ static bool ApplyPatches() {
 }
 
 bool SoundAI::InstallPatches(void* module) {
-    OpenLog(module);
+#ifdef _DEBUG
+    char path[MAX_PATH] = "";
+    DWORD len = GetModuleFileNameA(static_cast<HMODULE>(module), path, MAX_PATH);
+    char* dot = (len > 0 && len < MAX_PATH) ? std::strrchr(path, '.') : nullptr;
+    if (dot && dot >= std::strrchr(path, '\\') && static_cast<size_t>(dot - path) + sizeof(".log") <= sizeof(path)) {
+        std::strcpy(dot, ".log");
+        gLogFile = std::fopen(path, "w");
+    }
     LOG("NFSC_RestoreHeatConditions %s starting.", kVersion);
+#else
+    (void)module;
+#endif
+
     if (!IsVanillaCode()) return false;
     if (!ApplyPatches()) {
         LOG("Heat jump: the game's code could not be changed.");
@@ -184,7 +176,12 @@ void SoundAI::RestorePatches() {
         const SavedDword& patch = gSaved[--gSavedCount];
         WriteMemory(patch.address, &patch.value, sizeof(patch.value));
     }
-    CloseLog();
+#ifdef _DEBUG
+    if (gLogFile) {
+        std::fclose(gLogFile);
+        gLogFile = nullptr;
+    }
+#endif
 }
 
 void SoundAI::SyncPlayers() {
