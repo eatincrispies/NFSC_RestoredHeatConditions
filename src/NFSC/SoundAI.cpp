@@ -8,21 +8,22 @@
 #include <cstring>
 #include "SoundAI.hpp"
 
+using namespace Csis;
+
 static constexpr uintptr_t kAddrSyncPlayers = 0x00793840u;
 static constexpr uintptr_t kAddrHeatCutoffs = 0x009ECCB4u;
 static constexpr uintptr_t kAddrPrevHeat    = 0x00A71BA8u;
 
-static constexpr SoundAI::HeatCutoffs kVanillaCutoffs[] = {
-    { 2.0f, Csis::Type_heat_level_2 },
-    { 3.0f, Csis::Type_heat_level_3 },
-    { 4.0f, Csis::Type_heat_level_4 },
-    { 5.0f, Csis::Type_heat_level_5 },
-};
-
 static constexpr SoundAI::HeatCutoffs kRestoredCutoffs[] = {
-    { 2.0f, Csis::Type_heat_level_2 },  { 3.0f, Csis::Type_heat_level_3 },  { 4.0f, Csis::Type_heat_level_4 },
-    { 5.0f, Csis::Type_heat_level_5 },  { 6.0f, Csis::Type_heat_level_6 },  { 7.0f, Csis::Type_heat_level_7 },
-    { 8.0f, Csis::Type_heat_level_8 },  { 9.0f, Csis::Type_heat_level_9 },  { 10.0f, Csis::Type_heat_level_10 },
+    {  2.0f, Type_heat_level_2  },
+    {  3.0f, Type_heat_level_3  },
+    {  4.0f, Type_heat_level_4  },
+    {  5.0f, Type_heat_level_5  },
+    {  6.0f, Type_heat_level_6  },
+    {  7.0f, Type_heat_level_7  },
+    {  8.0f, Type_heat_level_8  },
+    {  9.0f, Type_heat_level_9  },
+    { 10.0f, Type_heat_level_10 },
 };
 
 static_assert(sizeof(SoundAI::HeatCutoffs) == 8, "SoundAI::heat_cutoffs entries are 8 bytes");
@@ -107,7 +108,7 @@ static bool PatchDword(uintptr_t addr, uint32_t val) {
 }
 
 static bool IsVanillaCode() {
-    if (!BytesMatch(kAddrHeatCutoffs, kVanillaCutoffs, sizeof(kVanillaCutoffs))) {
+    if (!BytesMatch(kAddrHeatCutoffs, kRestoredCutoffs, 4 * sizeof(kRestoredCutoffs[0]))) {
         LOG("Heat jump: SoundAI::heat_cutoffs is not the game's own table, so nothing is changed.");
         return false;
     }
