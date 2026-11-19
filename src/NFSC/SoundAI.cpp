@@ -8,248 +8,169 @@
 #include <cstring>
 #include "SoundAI.hpp"
 
-namespace Log {
+static constexpr const char* kVersion = "V1.0.0";
 
-#if defined(_DEBUG)
-    namespace {
+static constexpr uintptr_t kAddrSyncPlayers = 0x00793840u;
+static constexpr uintptr_t kAddrHeatCutoffs = 0x009ECCB4u;
+static constexpr uintptr_t kAddrPrevHeat    = 0x00A71BA8u;
 
-        FILE* gFile = nullptr;
+static constexpr SoundAI::HeatCutoffs kVanillaCutoffs[] = {
+    { 2.0f, Csis::Type_heat_level_2 },
+    { 3.0f, Csis::Type_heat_level_3 },
+    { 4.0f, Csis::Type_heat_level_4 },
+    { 5.0f, Csis::Type_heat_level_5 },
+};
 
-    }
+static constexpr SoundAI::HeatCutoffs kRestoredCutoffs[] = {
+    { 2.0f, Csis::Type_heat_level_2 },  { 3.0f, Csis::Type_heat_level_3 },  { 4.0f, Csis::Type_heat_level_4 },
+    { 5.0f, Csis::Type_heat_level_5 },  { 6.0f, Csis::Type_heat_level_6 },  { 7.0f, Csis::Type_heat_level_7 },
+    { 8.0f, Csis::Type_heat_level_8 },  { 9.0f, Csis::Type_heat_level_9 },  { 10.0f, Csis::Type_heat_level_10 },
+};
 
-    void Open(void* module) {
-        char path[MAX_PATH] = "";
-        const DWORD length = GetModuleFileNameA(static_cast<HMODULE>(module), path, MAX_PATH);
-        char* dot = length && length < MAX_PATH ? std::strrchr(path, '.') : nullptr;
-        if (!dot || dot < std::strrchr(path, '\\')) return;
-        std::strcpy(dot, ".log");
-        gFile = std::fopen(path, "w");
-    }
+static_assert(sizeof(SoundAI::HeatCutoffs) == 8, "SoundAI::heat_cutoffs entries are 8 bytes");
+static_assert(offsetof(SoundAI, mPlayerHeat) == 0x100, "SoundAI::mPlayerHeat");
 
-    void Close() {
-        if (gFile) std::fclose(gFile);
-        gFile = nullptr;
-    }
+#ifdef _DEBUG
+static FILE* gLogFile = nullptr;
 
-    void Write(const char* format, ...) {
-        if (!gFile) return;
-        char line[256] = "";
-        va_list args;
-        va_start(args, format);
-        std::vsnprintf(line, sizeof(line) - 2, format, args);
-        va_end(args);
-        std::strcat(line, "\n");
-        std::fputs(line, gFile);
-        std::fflush(gFile);
-    }
+static void OpenLog(void* module) {
+    char path[MAX_PATH] = "";
+    DWORD len = GetModuleFileNameA(static_cast<HMODULE>(module), path, MAX_PATH);
+    char* dot = (len > 0 && len < MAX_PATH) ? std::strrchr(path, '.') : nullptr;
+    if (!dot || dot < std::strrchr(path, '\\')) return;
+    if (static_cast<size_t>(dot - path) + sizeof(".log") > sizeof(path)) return;
+    std::strcpy(dot, ".log");
+    gLogFile = std::fopen(path, "w");
+}
+
+static void CloseLog() {
+    if (gLogFile) std::fclose(gLogFile);
+    gLogFile = nullptr;
+}
+
+static void WriteLog(const char* fmt, ...) {
+    if (!gLogFile) return;
+    char line[256] = "";
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(line, sizeof(line) - 2, fmt, args);
+    va_end(args);
+    std::strcat(line, "\n");
+    std::fputs(line, gLogFile);
+    std::fflush(gLogFile);
+}
+
+#define LOG(...) WriteLog(__VA_ARGS__)
 #else
-    void Open(void*) {}
-    void Close() {}
-    void Write(const char* format, ...);
+static void OpenLog(void*) {}
+static void CloseLog() {}
+static void WriteLog(const char*, ...);
+#define LOG(...) ((void)sizeof((WriteLog(__VA_ARGS__), 0)))
 #endif
 
+struct SavedDword {
+    uintptr_t address;
+    uint32_t  value;
+};
+
+static SavedDword gSaved[8]   = {};
+static int        gSavedCount = 0;
+
+static int SafeCopy(void* dst, const void* src, size_t size) {
+    __try {
+        std::memcpy(dst, src, size);
+        return 1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return 0;
+    }
 }
 
-#if defined(_DEBUG)
-#define LOG(...) Log::Write(__VA_ARGS__)
-#else
-#define LOG(...) ((void)sizeof((Log::Write(__VA_ARGS__), 0)))
-#endif
-
-namespace Memory {
-
-    namespace {
-
-        int SafeCopy(void* destination, const void* source, size_t length) {
-            __try {
-                std::memcpy(destination, source, length);
-                return 1;
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                return 0;
-            }
-        }
-
-    }
-
-    bool Read(uintptr_t va, void* out, size_t length) {
-        return SafeCopy(out, reinterpret_cast<const void*>(va), length) != 0;
-    }
-
-    bool Matches(uintptr_t va, const void* expected, size_t length) {
-        uint8_t bytes[64] = {};
-        return length <= sizeof(bytes) && Read(va, bytes, length) && std::memcmp(bytes, expected, length) == 0;
-    }
-
-    bool WriteCode(uintptr_t va, const void* bytes, size_t length) {
-        void* target = reinterpret_cast<void*>(va);
-        DWORD oldProtect = 0;
-        if (!VirtualProtect(target, length, PAGE_EXECUTE_READWRITE, &oldProtect)) return false;
-        std::memcpy(target, bytes, length);
-        FlushInstructionCache(GetCurrentProcess(), target, length);
-        DWORD unused = 0;
-        VirtualProtect(target, length, oldProtect, &unused);
-        return true;
-    }
-
+static bool SafeRead(uintptr_t addr, void* out, size_t size) {
+    return SafeCopy(out, reinterpret_cast<const void*>(addr), size) != 0;
 }
 
-namespace Patch {
-
-    struct CodeSite {
-        uintptr_t va;
-        uint8_t   code[7];
-        size_t    length;
-        size_t    operand;
-    };
-
-    namespace {
-
-        constexpr int kMostPatches = 8;
-
-        struct Original {
-            uintptr_t va;
-            uint32_t  value;
-        };
-
-        Original gOriginals[kMostPatches] = {};
-        int      gCount = 0;
-
-        uint32_t CallOffset(uintptr_t call, uintptr_t target) {
-            return static_cast<uint32_t>(target) - static_cast<uint32_t>(call + 5);
-        }
-
-    }
-
-    bool IsGameCode(const CodeSite& site) {
-        return Memory::Matches(site.va, site.code, site.length);
-    }
-
-    bool CallsTo(const CodeSite& call, uintptr_t function) {
-        uint32_t offset = 0;
-        return IsGameCode(call) && Memory::Read(call.va + call.operand, &offset, sizeof(offset)) && offset == CallOffset(call.va, function);
-    }
-
-    bool WriteOperand(const CodeSite& site, uint32_t value) {
-        const uintptr_t va = site.va + site.operand;
-        uint32_t original = 0;
-        if (gCount >= kMostPatches || !Memory::Read(va, &original, sizeof(original)) || !Memory::WriteCode(va, &value, sizeof(value)))
-            return false;
-        gOriginals[gCount++] = { va, original };
-        return true;
-    }
-
-    bool RedirectCall(const CodeSite& call, const void* replacement) {
-        return WriteOperand(call, CallOffset(call.va, reinterpret_cast<uintptr_t>(replacement)));
-    }
-
-    void RestoreAll() {
-        while (gCount > 0) {
-            const Original& original = gOriginals[--gCount];
-            Memory::WriteCode(original.va, &original.value, sizeof(original.value));
-        }
-    }
-
+static bool BytesMatch(uintptr_t addr, const void* expected, size_t size) {
+    uint8_t buf[64] = {};
+    return size <= sizeof(buf) && SafeRead(addr, buf, size) && std::memcmp(buf, expected, size) == 0;
 }
 
-namespace Game {
-
-    template <typename Return, typename... Args>
-    Return ThisCall(uintptr_t function, Args... args) {
-        return reinterpret_cast<Return (__thiscall*)(Args...)>(function)(args...);
-    }
-
-    template <typename Method>
-    const void* MethodAddress(Method method) {
-        static_assert(sizeof(method) == sizeof(void*), "only plain member functions have a single code address");
-        const void* address = nullptr;
-        std::memcpy(&address, &method, sizeof(address));
-        return address;
-    }
-
-    template <typename T>
-    T& Global(uintptr_t va) {
-        return *reinterpret_cast<T*>(va);
-    }
-
+static bool WriteMemory(uintptr_t addr, const void* data, size_t size) {
+    void* target  = reinterpret_cast<void*>(addr);
+    DWORD oldProt = 0;
+    if (!VirtualProtect(target, size, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+    std::memcpy(target, data, size);
+    FlushInstructionCache(GetCurrentProcess(), target, size);
+    DWORD unused = 0;
+    VirtualProtect(target, size, oldProt, &unused);
+    return true;
 }
 
-namespace {
+static uint32_t Rel32(uintptr_t callSite, uintptr_t target) {
+    return static_cast<uint32_t>(target) - static_cast<uint32_t>(callSite + 5);
+}
 
-    constexpr const char* kVersion = "V1.0.0";
+static bool IsCallTo(uintptr_t callSite, uintptr_t target) {
+    uint8_t insn[5] = {};
+    if (!SafeRead(callSite, insn, sizeof(insn)) || insn[0] != 0xE8) return false;
+    uint32_t rel = 0;
+    std::memcpy(&rel, insn + 1, sizeof(rel));
+    return rel == Rel32(callSite, target);
+}
 
-    constexpr uintptr_t kSyncPlayers         = 0x00793840u;
-    constexpr uintptr_t kHeatCutoffs         = 0x009ECCB4u;
-    constexpr uintptr_t kSyncPlayersPrevHeat = 0x00A71BA8u;
+static bool PatchDword(uintptr_t addr, uint32_t val) {
+    if (gSavedCount >= static_cast<int>(sizeof(gSaved) / sizeof(gSaved[0]))) return false;
+    uint32_t orig = 0;
+    if (!SafeRead(addr, &orig, sizeof(orig)) || !WriteMemory(addr, &val, sizeof(val))) return false;
+    gSaved[gSavedCount++] = { addr, orig };
+    return true;
+}
 
-    constexpr Patch::CodeSite kSyncPlayersCutoffLoop = { 0x00793C59u, { 0xBD, 0x03, 0x00, 0x00, 0x00 }, 5, 1 };
-
-    constexpr Patch::CodeSite kSyncPlayersCutoffValues[] = {
-        { 0x00793C66u, { 0xD8, 0x1C, 0xED, 0xB4, 0xCC, 0x9E, 0x00 }, 7, 3 },
-        { 0x00793C7Bu, { 0xD8, 0x1C, 0xED, 0xB4, 0xCC, 0x9E, 0x00 }, 7, 3 },
-    };
-
-    constexpr Patch::CodeSite kSyncPlayersCutoffHeatLevels[] = {
-        { 0x00793CCBu, { 0x8B, 0x0C, 0xED, 0xB8, 0xCC, 0x9E, 0x00 }, 7, 3 },
-        { 0x00793D23u, { 0x8B, 0x04, 0xED, 0xB8, 0xCC, 0x9E, 0x00 }, 7, 3 },
-    };
-
-    constexpr Patch::CodeSite kOnTaskSyncPlayers = { 0x007984F8u, { 0xE8 }, 1, 1 };
-
-    constexpr SoundAI::HeatCutoffs kGameHeatCutoffs[] = {
-        { 2.0f, Csis::Type_heat_level_2 },
-        { 3.0f, Csis::Type_heat_level_3 },
-        { 4.0f, Csis::Type_heat_level_4 },
-        { 5.0f, Csis::Type_heat_level_5 },
-    };
-
-    constexpr SoundAI::HeatCutoffs kRestoredHeatCutoffs[] = {
-        { 2.0f, Csis::Type_heat_level_2 },  { 3.0f, Csis::Type_heat_level_3 },  { 4.0f, Csis::Type_heat_level_4 },
-        { 5.0f, Csis::Type_heat_level_5 },  { 6.0f, Csis::Type_heat_level_6 },  { 7.0f, Csis::Type_heat_level_7 },
-        { 8.0f, Csis::Type_heat_level_8 },  { 9.0f, Csis::Type_heat_level_9 },  { 10.0f, Csis::Type_heat_level_10 },
-    };
-
-    constexpr uint32_t kLastRestoredCutoff = sizeof(kRestoredHeatCutoffs) / sizeof(kRestoredHeatCutoffs[0]) - 1;
-
-    static_assert(sizeof(SoundAI::HeatCutoffs) == 8, "SoundAI::heat_cutoffs entries are 8 bytes");
-    static_assert(offsetof(SoundAI, mPlayerHeat) == 0x100, "SoundAI::mPlayerHeat");
-
-    uint32_t Address(const void* pointer) {
-        return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pointer));
+static bool IsVanillaCode() {
+    if (!BytesMatch(kAddrHeatCutoffs, kVanillaCutoffs, sizeof(kVanillaCutoffs))) {
+        LOG("Heat jump: SoundAI::heat_cutoffs is not the game's own table, so nothing is changed.");
+        return false;
     }
 
-    float& prev_heat() {
-        return Game::Global<float>(kSyncPlayersPrevHeat);
-    }
+    const uint8_t movEbp3[]    = { 0xBD, 0x03, 0x00, 0x00, 0x00 };
+    const uint8_t fcompValue[] = { 0xD8, 0x1C, 0xED, 0xB4, 0xCC, 0x9E, 0x00 };
+    const uint8_t movEcxLvl[]  = { 0x8B, 0x0C, 0xED, 0xB8, 0xCC, 0x9E, 0x00 };
+    const uint8_t movEaxLvl[]  = { 0x8B, 0x04, 0xED, 0xB8, 0xCC, 0x9E, 0x00 };
 
-    bool GameCodeIsVanilla() {
-        if (!Memory::Matches(kHeatCutoffs, kGameHeatCutoffs, sizeof(kGameHeatCutoffs))) {
-            LOG("Heat jump: SoundAI::heat_cutoffs is not the game's own table, so nothing is changed.");
-            return false;
-        }
-        bool vanilla = Patch::IsGameCode(kSyncPlayersCutoffLoop) && Patch::CallsTo(kOnTaskSyncPlayers, kSyncPlayers);
-        for (const Patch::CodeSite& site : kSyncPlayersCutoffValues) vanilla = vanilla && Patch::IsGameCode(site);
-        for (const Patch::CodeSite& site : kSyncPlayersCutoffHeatLevels) vanilla = vanilla && Patch::IsGameCode(site);
-        if (!vanilla) LOG("Heat jump: another mod already changed SoundAI::SyncPlayers, so nothing is changed.");
-        return vanilla;
-    }
+    const bool ok =
+        BytesMatch(0x00793C59u, movEbp3, sizeof(movEbp3)) &&
+        BytesMatch(0x00793C66u, fcompValue, sizeof(fcompValue)) &&
+        BytesMatch(0x00793C7Bu, fcompValue, sizeof(fcompValue)) &&
+        BytesMatch(0x00793CCBu, movEcxLvl, sizeof(movEcxLvl)) &&
+        BytesMatch(0x00793D23u, movEaxLvl, sizeof(movEaxLvl)) &&
+        IsCallTo(0x007984F8u, kAddrSyncPlayers);
 
-    bool UseRestoredHeatCutoffs() {
-        bool applied = Patch::WriteOperand(kSyncPlayersCutoffLoop, kLastRestoredCutoff);
-        for (const Patch::CodeSite& site : kSyncPlayersCutoffValues)
-            applied = applied && Patch::WriteOperand(site, Address(&kRestoredHeatCutoffs[0].value));
-        for (const Patch::CodeSite& site : kSyncPlayersCutoffHeatLevels)
-            applied = applied && Patch::WriteOperand(site, Address(&kRestoredHeatCutoffs[0].heat_level));
-        return applied;
-    }
+    if (!ok) LOG("Heat jump: another mod already changed SoundAI::SyncPlayers, so nothing is changed.");
+    return ok;
+}
 
+static bool ApplyPatches() {
+    constexpr uint32_t lastIdx = static_cast<uint32_t>(sizeof(kRestoredCutoffs) / sizeof(kRestoredCutoffs[0]) - 1);
+    const uint32_t valuesAddr  = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&kRestoredCutoffs[0].value));
+    const uint32_t levelsAddr  = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(&kRestoredCutoffs[0].heat_level));
+
+    auto hook = &SoundAI::SyncPlayersAndRearmHeatJump;
+    uintptr_t hookAddr = 0;
+    static_assert(sizeof(hook) == sizeof(hookAddr), "only plain member functions have a single address");
+    std::memcpy(&hookAddr, &hook, sizeof(hookAddr));
+
+    return PatchDword(0x00793C59u + 1, lastIdx) &&
+           PatchDword(0x00793C66u + 3, valuesAddr) &&
+           PatchDword(0x00793C7Bu + 3, valuesAddr) &&
+           PatchDword(0x00793CCBu + 3, levelsAddr) &&
+           PatchDword(0x00793D23u + 3, levelsAddr) &&
+           PatchDword(0x007984F8u + 1, Rel32(0x007984F8u, hookAddr));
 }
 
 bool SoundAI::InstallPatches(void* module) {
-    Log::Open(module);
+    OpenLog(module);
     LOG("NFSC_RestoreHeatConditions %s starting.", kVersion);
-    if (!GameCodeIsVanilla()) return false;
-    if (!UseRestoredHeatCutoffs() || !Patch::RedirectCall(kOnTaskSyncPlayers, Game::MethodAddress(&SoundAI::SyncPlayersAndRearmHeatJump))) {
+    if (!IsVanillaCode()) return false;
+    if (!ApplyPatches()) {
         LOG("Heat jump: the game's code could not be changed.");
         RestorePatches();
         return false;
@@ -259,21 +180,26 @@ bool SoundAI::InstallPatches(void* module) {
 }
 
 void SoundAI::RestorePatches() {
-    Patch::RestoreAll();
-    Log::Close();
+    while (gSavedCount > 0) {
+        const SavedDword& patch = gSaved[--gSavedCount];
+        WriteMemory(patch.address, &patch.value, sizeof(patch.value));
+    }
+    CloseLog();
 }
 
 void SoundAI::SyncPlayers() {
-    Game::ThisCall<void>(kSyncPlayers, this);
+    reinterpret_cast<void(__thiscall*)(SoundAI*)>(kAddrSyncPlayers)(this);
 }
 
 void SoundAI::SyncPlayersAndRearmHeatJump() {
-    const float before = prev_heat();
+    float& prevHeat = *reinterpret_cast<float*>(kAddrPrevHeat);
+    const float before = prevHeat;
     SyncPlayers();
-    const float after = prev_heat();
-    if (after != before) LOG("Heat jump: the radio calls out your heat jump to %.1f.", after);
+    const float after = prevHeat;
 
+    if (after != before) LOG("Heat jump: the radio calls out your heat jump to %.1f.", after);
     if (mPlayerHeat < 1 || mPlayerHeat >= static_cast<int>(after)) return;
-    prev_heat() = static_cast<float>(mPlayerHeat);
+
+    prevHeat = static_cast<float>(mPlayerHeat);
     LOG("Heat jump: your heat dropped to %d, so the next jump above it gets its call.", mPlayerHeat);
 }

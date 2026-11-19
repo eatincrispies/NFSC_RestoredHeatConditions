@@ -2,6 +2,7 @@
 
 namespace Csis {
 
+
     enum Type_heat_level {
         Type_heat_level_2  = 1,
         Type_heat_level_3  = 2,
@@ -28,6 +29,7 @@ class SoundAI {
 
     void SyncPlayers();
     void SyncPlayersAndRearmHeatJump();
+
 
     unsigned char mBeforePlayerHeat[0x100];
     int           mPlayerHeat;
